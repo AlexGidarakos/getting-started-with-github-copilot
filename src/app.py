@@ -10,17 +10,20 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
-app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+# MongoDB setup
+MONGO_URL = "mongodb://localhost:27017"
+DB_NAME = "mergington"
+COLLECTION_NAME = "activities"
 
-# Mount the static files directory
-current_dir = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
-          "static")), name="static")
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
+activities_col = db[COLLECTION_NAME]
 
-# In-memory activity database
-activities = {
+# Pre-populate activities if collection is empty
+hardcoded_activities = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -80,6 +83,22 @@ activities = {
     }
 }
 
+if activities_col.count_documents({}) == 0:
+    for name, details in hardcoded_activities.items():
+        doc = {"_id": name, **details}
+        try:
+            activities_col.insert_one(doc)
+        except DuplicateKeyError:
+            pass
+
+app = FastAPI(title="Mergington High School API",
+              description="API for viewing and signing up for extracurricular activities")
+
+# Mount the static files directory
+current_dir = Path(__file__).parent
+app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
+          "static")), name="static")
+
 
 @app.get("/")
 def root():
@@ -88,23 +107,36 @@ def root():
 
 @app.get("/activities")
 def get_activities():
+    # Fetch all activities from MongoDB and return as dict keyed by activity name
+    activities = {}
+    for doc in activities_col.find():
+        name = doc["_id"]
+        details = {k: v for k, v in doc.items() if k != "_id"}
+        activities[name] = details
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
+    doc = activities_col.find_one({"_id": activity_name})
+    if not doc:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
-
-    # Validate student is not already signed up
-    if email in activity["participants"]:
+    if email in doc["participants"]:
         raise HTTPException(status_code=400, detail="Student already signed up")
-
-    # Add student
-    activity["participants"].append(email)
+    if len(doc["participants"]) >= doc["max_participants"]:
+        raise HTTPException(status_code=400, detail="Activity is full")
+    activities_col.update_one({"_id": activity_name}, {"$push": {"participants": email}})
     return {"message": f"Signed up {email} for {activity_name}"}
+
+
+@app.delete("/activities/{activity_name}/unregister")
+def unregister_participant(activity_name: str, email: str):
+    """Unregister a student from an activity"""
+    doc = activities_col.find_one({"_id": activity_name})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    if email not in doc["participants"]:
+        raise HTTPException(status_code=400, detail="Student not signed up")
+    activities_col.update_one({"_id": activity_name}, {"$pull": {"participants": email}})
+    return {"message": f"Unregistered {email} from {activity_name}"}
